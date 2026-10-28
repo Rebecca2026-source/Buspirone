@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>analysis.py</title>
+<style>body{margin:24px;font-family:Consolas,Menlo,monospace;font-size:13px}pre{white-space:pre;overflow-x:auto}</style>
+</head>
+<body>
+<pre><code>import math
+import warnings
+
+import numpy as np
+import pandas as pd
+import patsy
+import scipy.stats as stats
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.stats.multitest import multipletests
+
+warnings.filterwarnings(&quot;ignore&quot;)
+
+OUTCOMES = [&quot;SHAPS&quot;, &quot;HAMD&quot;, &quot;HAMA&quot;, &quot;BDI&quot;, &quot;BAI&quot;]
+FOLLOWUPS = [&quot;3M&quot;, &quot;6M&quot;]
+VISITS = [&quot;0W&quot;, &quot;3M&quot;, &quot;6M&quot;]
+N_ITEMS = {&quot;SHAPS&quot;: 14, &quot;HAMD&quot;: 17, &quot;HAMA&quot;: 14, &quot;BDI&quot;: 21, &quot;BAI&quot;: 21}
+REDUCED = [&quot;HAMD_m7&quot;, &quot;HAMD_m7_14&quot;, &quot;BDI_m4&quot;, &quot;BDI_anh&quot;]
+CONFOUNDERS = [&quot;Age&quot;, &quot;sex_male&quot;, &quot;Education_years&quot;, &quot;log_total_illness&quot;, &quot;log_current_episode&quot;,
+               &quot;log_untreated&quot;, &quot;SHAPS_0W&quot;, &quot;HAMD_0W&quot;, &quot;HAMA_0W&quot;, &quot;BDI_0W&quot;, &quot;BAI_0W&quot;, &quot;FE_0W&quot;]
+
+
+def items(scale):
+    return [f&quot;{scale}_{i:02d}&quot; for i in range(1, N_ITEMS[scale] + 1)]
+
+
+def score(scales):
+    d = scales.copy()
+    for s in OUTCOMES:
+        d[s] = d[items(s)].sum(axis=1)
+    d[&quot;HAMD_m7&quot;] = d[&quot;HAMD&quot;] - d[&quot;HAMD_07&quot;]
+    d[&quot;HAMD_m7_14&quot;] = d[&quot;HAMD&quot;] - d[&quot;HAMD_07&quot;] - d[&quot;HAMD_14&quot;]
+    d[&quot;BDI_anh&quot;] = d[[&quot;BDI_04&quot;, &quot;BDI_12&quot;, &quot;BDI_15&quot;, &quot;BDI_21&quot;]].sum(axis=1)
+    d[&quot;BDI_m4&quot;] = d[&quot;BDI&quot;] - d[&quot;BDI_anh&quot;]
+    d[&quot;SHAPS_dich&quot;] = (d[items(&quot;SHAPS&quot;)] &gt;= 3).sum(axis=1)
+    return d
+
+
+def build_wide(participants, scored):
+    w = participants.copy()
+    for v in VISITS:
+        x = scored[scored.visit == v].set_index(&quot;ID&quot;)
+        for c in OUTCOMES + REDUCED + [&quot;SHAPS_dich&quot;]:
+            w[f&quot;{c}_{v}&quot;] = w.ID.map(x[c])
+    w[&quot;observed_3M&quot;] = w.SHAPS_3M.notna()
+    w[&quot;observed_6M&quot;] = w.SHAPS_6M.notna()
+    w[&quot;analysis_sample&quot;] = w.observed_3M | w.observed_6M
+    w[&quot;log_total_illness&quot;] = np.log1p(w.Total_illness_duration_months)
+    w[&quot;log_current_episode&quot;] = np.log1p(w.Current_episode_duration_months)
+    w[&quot;log_untreated&quot;] = np.log1p(w.Untreated_duration_months)
+    return w
+
+
+def mean_sd(x):
+    x = pd.to_numeric(x, errors=&quot;coerce&quot;).dropna()
+    return x.mean(), x.std(ddof=1), len(x)
+
+
+def median_iqr(x):
+    x = pd.to_numeric(x, errors=&quot;coerce&quot;).dropna()
+    return x.median(), x.quantile(0.25), x.quantile(0.75)
+
+
+def smd(a, b):
+    a = pd.to_numeric(a, errors=&quot;coerce&quot;).dropna()
+    b = pd.to_numeric(b, errors=&quot;coerce&quot;).dropna()
+    pooled = math.sqrt((a.var(ddof=1) + b.var(ddof=1)) / 2)
+    return abs(a.mean() - b.mean()) / pooled if pooled else np.nan
+
+
+def weighted_smd(x, g, w):
+    m1 = np.average(x[g == 1], weights=w[g == 1])
+    m0 = np.average(x[g == 0], weights=w[g == 0])
+    v1 = np.average((x[g == 1] - m1) ** 2, weights=w[g == 1])
+    v0 = np.average((x[g == 0] - m0) ** 2, weights=w[g == 0])
+    return abs(m1 - m0) / math.sqrt((v1 + v0) / 2)
+
+
+def table1(w):
+    rows = []
+    t, c = w[w.group_treat == 1], w[w.group_treat == 0]
+    for v in [&quot;Age&quot;, &quot;Education_years&quot;, &quot;Onset_age&quot;, &quot;FE_0W&quot;, &quot;SHAPS_0W&quot;, &quot;HAMD_0W&quot;, &quot;HAMA_0W&quot;, &quot;BDI_0W&quot;, &quot;BAI_0W&quot;]:
+        rows.append({&quot;variable&quot;: v, &quot;buspirone&quot;: mean_sd(t[v])[:2], &quot;control&quot;: mean_sd(c[v])[:2],
+                     &quot;smd&quot;: smd(t[v], c[v]), &quot;p&quot;: stats.ttest_ind(t[v], c[v], nan_policy=&quot;omit&quot;).pvalue})
+    for v in [&quot;Current_episode_duration_months&quot;, &quot;Total_illness_duration_months&quot;, &quot;Untreated_duration_months&quot;]:
+        rows.append({&quot;variable&quot;: v, &quot;buspirone&quot;: median_iqr(t[v]), &quot;control&quot;: median_iqr(c[v]),
+                     &quot;smd&quot;: smd(t[v], c[v]), &quot;p&quot;: stats.mannwhitneyu(t[v].dropna(), c[v].dropna(), alternative=&quot;two-sided&quot;).pvalue})
+    for v in [&quot;sex_male&quot;, &quot;Benzodiazepine_present_0W&quot;, &quot;Zdrug_or_hypnotic_present_0W&quot;]:
+        tab = pd.crosstab(w[v], w.group_treat)
+        p = stats.fisher_exact(tab.values)[1] if tab.shape == (2, 2) and tab.values.min() &lt; 5 else stats.chi2_contingency(tab)[1]
+        rows.append({&quot;variable&quot;: v, &quot;buspirone&quot;: int(t[v].sum()), &quot;control&quot;: int(c[v].sum()), &quot;smd&quot;: smd(t[v], c[v]), &quot;p&quot;: p})
+    for v in [&quot;Center&quot;, &quot;SSRI_type_0W&quot;]:
+        tab = pd.crosstab(w[v], w.group_treat)
+        rows.append({&quot;variable&quot;: v, &quot;buspirone&quot;: tab[1].to_dict(), &quot;control&quot;: tab[0].to_dict(), &quot;smd&quot;: np.nan,
+                     &quot;p&quot;: stats.chi2_contingency(tab)[1]})
+    return pd.DataFrame(rows)
+
+
+def baseline_difference(w, outcome):
+    a = w.loc[w.group_treat == 1, f&quot;{outcome}_0W&quot;].dropna()
+    b = w.loc[w.group_treat == 0, f&quot;{outcome}_0W&quot;].dropna()
+    diff = a.mean() - b.mean()
+    df = len(a) + len(b) - 2
+    sp = math.sqrt(((len(a) - 1) * a.var(ddof=1) + (len(b) - 1) * b.var(ddof=1)) / df)
+    se = sp * math.sqrt(1 / len(a) + 1 / len(b))
+    tcrit = stats.t.ppf(0.975, df)
+    return {&quot;outcome&quot;: outcome, &quot;difference&quot;: diff, &quot;ci_low&quot;: diff - tcrit * se, &quot;ci_high&quot;: diff + tcrit * se,
+            &quot;p&quot;: stats.ttest_ind(a, b).pvalue}
+
+
+def make_long(w, outcome, ids=None, extra=()):
+    src = w[w.analysis_sample]
+    if ids is not None:
+        src = src[src.ID.isin(set(ids))]
+    rows = []
+    for tp in FOLLOWUPS:
+        cols = [&quot;ID&quot;, &quot;group_treat&quot;, &quot;Center&quot;, &quot;FE_0W&quot;, f&quot;FE_{tp}&quot;, f&quot;{outcome}_0W&quot;, f&quot;{outcome}_{tp}&quot;] + list(extra)
+        cols = list(dict.fromkeys(cols))
+        x = src[cols].rename(columns={f&quot;{outcome}_{tp}&quot;: &quot;y&quot;, f&quot;{outcome}_0W&quot;: &quot;baseline&quot;, f&quot;FE_{tp}&quot;: &quot;FE_time&quot;}).copy()
+        x[&quot;time&quot;] = tp
+        rows.append(x)
+    long = pd.concat(rows, ignore_index=True).dropna(subset=[&quot;y&quot;, &quot;baseline&quot;, &quot;FE_0W&quot;])
+    long[&quot;time&quot;] = pd.Categorical(long[&quot;time&quot;], categories=FOLLOWUPS)
+    return long
+
+
+def fit_lmm(long, formula):
+    model = smf.mixedlm(formula, data=long, groups=long[&quot;ID&quot;])
+    for method in [&quot;lbfgs&quot;, &quot;bfgs&quot;, &quot;cg&quot;, &quot;powell&quot;, &quot;nm&quot;]:
+        try:
+            res = model.fit(reml=False, method=method, maxiter=1000, disp=False)
+            if res.converged and np.isfinite(res.llf) and float(res.cov_re.iloc[0, 0]) &gt; 0:
+                return res
+        except Exception:
+            continue
+    raise RuntimeError(formula)
+
+
+def contrasts(res, long):
+    info = res.model.data.design_info
+    params = res.fe_params
+    names = list(params.index)
+    cov = res.cov_params().loc[names, names]
+    out = {}
+    for tp in FOLLOWUPS:
+        base = long[long[&quot;time&quot;] == tp].copy()
+        vec = {}
+        for g in (0, 1):
+            new = base.copy()
+            new[&quot;group_treat&quot;] = g
+            new[&quot;time&quot;] = pd.Categorical([tp] * len(new), categories=FOLLOWUPS)
+            vec[g] = patsy.build_design_matrices([info], new, return_type=&quot;dataframe&quot;)[0][names].mean(axis=0)
+        c = vec[1] - vec[0]
+        est = float(c @ params)
+        se = float(np.sqrt(c @ cov @ c))
+        out[tp] = {&quot;estimate&quot;: est, &quot;se&quot;: se, &quot;ci_low&quot;: est - 1.96 * se, &quot;ci_high&quot;: est + 1.96 * se,
+                   &quot;p&quot;: 2 * stats.norm.sf(abs(est / se))}
+    return out
+
+
+def lmm(w, outcome, fe=&quot;FE_0W&quot;, ids=None, covariates=()):
+    long = make_long(w, outcome, ids, extra=covariates)
+    fe_term = &quot;FE_time&quot; if fe == &quot;time&quot; else &quot;FE_0W&quot;
+    formula = f&quot;y ~ group_treat * C(time) + baseline + C(Center) + {fe_term}&quot;
+    if covariates:
+        formula += &quot; + &quot; + &quot; + &quot;.join(c for c in covariates if c != f&quot;{outcome}_0W&quot;)
+    if fe == &quot;time&quot;:
+        long = long.dropna(subset=[&quot;FE_time&quot;])
+    res = fit_lmm(long, formula)
+    out = contrasts(res, long)
+    out[&quot;interaction_p&quot;] = float(res.pvalues[&quot;group_treat:C(time)[T.6M]&quot;])
+    out[&quot;n_subjects&quot;] = long.ID.nunique()
+    return out
+
+
+def main_models(w):
+    res = {o: lmm(w, o) for o in OUTCOMES}
+    rows = [{&quot;outcome&quot;: o, &quot;time&quot;: tp, **res[o][tp]} for o in OUTCOMES for tp in FOLLOWUPS]
+    q = multipletests([r[&quot;p&quot;] for r in rows], method=&quot;fdr_bh&quot;)[1]
+    for r, qq in zip(rows, q):
+        r[&quot;q&quot;] = qq
+    return res, pd.DataFrame(rows)
+
+
+def cohen_d_change(w, outcome, estimate, tp):
+    d = w.dropna(subset=[f&quot;{outcome}_{tp}&quot;, f&quot;{outcome}_0W&quot;])
+    ch = d[f&quot;{outcome}_{tp}&quot;] - d[f&quot;{outcome}_0W&quot;]
+    a, b = ch[d.group_treat == 1], ch[d.group_treat == 0]
+    pooled = math.sqrt(((len(a) - 1) * a.var(ddof=1) + (len(b) - 1) * b.var(ddof=1)) / (len(a) + len(b) - 2))
+    return estimate / pooled
+
+
+def ancova(w, outcome, tp, ids=None):
+    d = w if ids is None else w[w.ID.isin(set(ids))]
+    d = d.dropna(subset=[f&quot;{outcome}_{tp}&quot;, f&quot;{outcome}_0W&quot;, &quot;FE_0W&quot;])
+    r = smf.ols(f&quot;{outcome}_{tp} ~ group_treat + {outcome}_0W + C(Center) + FE_0W&quot;, d).fit(cov_type=&quot;HC3&quot;)
+    e, se = float(r.params.group_treat), float(r.bse.group_treat)
+    return {&quot;estimate&quot;: e, &quot;ci_low&quot;: e - 1.96 * se, &quot;ci_high&quot;: e + 1.96 * se, &quot;p&quot;: float(r.pvalues.group_treat), &quot;n&quot;: int(r.nobs)}
+
+
+def sensitivity(w):
+    out = {&quot;time_varying_FE&quot;: lmm(w, &quot;SHAPS&quot;, fe=&quot;time&quot;)}
+    out[&quot;complete_cases&quot;] = lmm(w, &quot;SHAPS&quot;, ids=w.loc[w.observed_3M &amp; w.observed_6M, &quot;ID&quot;])
+    out[&quot;no_benzo_zdrug&quot;] = lmm(w, &quot;SHAPS&quot;, ids=w.loc[(w.Benzodiazepine_present_0W.fillna(0) == 0)
+                                                      &amp; (w.Zdrug_or_hypnotic_present_0W.fillna(0) == 0), &quot;ID&quot;])
+    out[&quot;FE_20_40&quot;] = lmm(w, &quot;SHAPS&quot;, ids=w.loc[w.FE_0W.between(20, 40), &quot;ID&quot;])
+    for c in [&quot;HX&quot;, &quot;ST&quot;, &quot;JY&quot;, &quot;NC&quot;]:
+        out[f&quot;without_{c}&quot;] = lmm(w, &quot;SHAPS&quot;, ids=w.loc[w.Center != c, &quot;ID&quot;])
+    severe = w.loc[w.HAMD_0W &gt; 17, &quot;ID&quot;]
+    out[&quot;ancova_full&quot;] = {tp: ancova(w, &quot;SHAPS&quot;, tp) for tp in FOLLOWUPS}
+    out[&quot;ancova_HAMD_gt17&quot;] = {tp: ancova(w, &quot;SHAPS&quot;, tp, severe) for tp in FOLLOWUPS}
+    return out
+
+
+def missingness(w):
+    d = w.copy()
+    d[&quot;missing_6M&quot;] = (~d.observed_6M).astype(int)
+    r = smf.logit(&quot;missing_6M ~ group_treat + Age + sex_male + SHAPS_0W + HAMD_0W + HAMA_0W + FE_0W + C(Center)&quot;, d).fit(disp=False)
+    ci = r.conf_int()
+    return pd.DataFrame({&quot;OR&quot;: np.exp(r.params), &quot;ci_low&quot;: np.exp(ci[0]), &quot;ci_high&quot;: np.exp(ci[1]), &quot;p&quot;: r.pvalues})
+
+
+def rubin(est, var):
+    q, u = np.asarray(est), np.asarray(var)
+    m = len(q)
+    qbar, ubar, b = q.mean(), u.mean(), q.var(ddof=1)
+    total = ubar + (1 + 1 / m) * b
+    r = (1 + 1 / m) * b / ubar
+    df = (m - 1) * (1 + 1 / r) ** 2
+    se = math.sqrt(total)
+    t = stats.t.ppf(0.975, df)
+    return {&quot;estimate&quot;: qbar, &quot;ci_low&quot;: qbar - t * se, &quot;ci_high&quot;: qbar + t * se, &quot;p&quot;: 2 * stats.t.sf(abs(qbar / se), df)}
+
+
+def tipping_point(w, m=100, seed=20260716, deltas=range(0, 13)):
+    rng = np.random.default_rng(seed)
+    formula = &quot;SHAPS_6M ~ group_treat + SHAPS_0W + C(Center) + FE_0W&quot;
+    obs = w.dropna(subset=[&quot;SHAPS_6M&quot;, &quot;SHAPS_0W&quot;, &quot;FE_0W&quot;])
+    mis = w[w.SHAPS_6M.isna()].dropna(subset=[&quot;SHAPS_0W&quot;, &quot;FE_0W&quot;])
+    fit = smf.ols(formula, obs).fit()
+    xm = np.asarray(patsy.build_design_matrices([fit.model.data.design_info], mis, return_type=&quot;dataframe&quot;)[0])
+    beta, xtx_inv, df = np.asarray(fit.params), np.asarray(fit.normalized_cov_params), int(fit.df_resid)
+    s2 = float(fit.ssr / df)
+    imputations = []
+    for _ in range(m):
+        sigma2 = df * s2 / rng.chisquare(df)
+        b = rng.multivariate_normal(beta, sigma2 * xtx_inv)
+        imputations.append(xm @ b + rng.normal(0, math.sqrt(sigma2), len(mis)))
+    treated = mis.group_treat.to_numpy() == 1
+    out = []
+    for delta in deltas:
+        est, var = [], []
+        for y in imputations:
+            d = w.copy()
+            vals = y.copy()
+            vals[treated] += delta
+            d.loc[mis.index, &quot;SHAPS_6M&quot;] = vals
+            r = smf.ols(formula, d).fit(cov_type=&quot;HC3&quot;)
+            est.append(float(r.params.group_treat))
+            var.append(float(r.cov_params().loc[&quot;group_treat&quot;, &quot;group_treat&quot;]))
+        out.append({&quot;delta&quot;: delta, **rubin(est, var)})
+    return pd.DataFrame(out)
+
+
+def gee_contrasts(res):
+    b, v = res.params, res.cov_params()
+    out = {}
+    for tp in FOLLOWUPS:
+        c = pd.Series(0.0, index=b.index)
+        c[&quot;group_treat&quot;] = 1
+        if tp == &quot;6M&quot;:
+            c[&quot;group_treat:C(time)[T.6M]&quot;] = 1
+        est = float(c @ b)
+        se = float(np.sqrt(c @ v @ c))
+        out[tp] = {&quot;estimate&quot;: est, &quot;ci_low&quot;: est - 1.96 * se, &quot;ci_high&quot;: est + 1.96 * se, &quot;p&quot;: 2 * stats.norm.sf(abs(est / se))}
+    return out
+
+
+def confounding(w):
+    out = {&quot;multivariable&quot;: lmm(w, &quot;SHAPS&quot;, covariates=[c for c in CONFOUNDERS if c not in (&quot;SHAPS_0W&quot;, &quot;FE_0W&quot;)])}
+    d = w.dropna(subset=CONFOUNDERS).copy()
+    ps = smf.logit(&quot;group_treat ~ &quot; + &quot; + &quot;.join(CONFOUNDERS) + &quot; + C(Center)&quot;, d).fit(disp=False).predict(d)
+    pt = d.group_treat.mean()
+    d[&quot;iptw&quot;] = np.where(d.group_treat == 1, pt / ps, (1 - pt) / (1 - ps))
+    for c in d.Center.unique():
+        d[f&quot;center_{c}&quot;] = (d.Center == c).astype(int)
+    balance = []
+    for v in CONFOUNDERS + [f&quot;center_{c}&quot; for c in sorted(d.Center.unique())]:
+        balance.append({&quot;variable&quot;: v, &quot;smd_before&quot;: weighted_smd(d[v].to_numpy(), d.group_treat.to_numpy(), np.ones(len(d))),
+                        &quot;smd_after&quot;: weighted_smd(d[v].to_numpy(), d.group_treat.to_numpy(), d.iptw.to_numpy())})
+    out[&quot;balance&quot;] = pd.DataFrame(balance)
+    long = make_long(d.assign(analysis_sample=d.analysis_sample), &quot;SHAPS&quot;, extra=CONFOUNDERS + [&quot;iptw&quot;])
+    long = long.rename(columns={&quot;baseline&quot;: &quot;SHAPS_base&quot;})
+    ind = sm.cov_struct.Independence()
+    r1 = smf.gee(&quot;y ~ group_treat * C(time)&quot;, &quot;ID&quot;, long, weights=long.iptw, cov_struct=ind).fit()
+    covs = [c for c in CONFOUNDERS if c != &quot;SHAPS_0W&quot;] + [&quot;SHAPS_base&quot;]
+    r2 = smf.gee(&quot;y ~ group_treat * C(time) + &quot; + &quot; + &quot;.join(covs) + &quot; + C(Center)&quot;, &quot;ID&quot;, long, weights=long.iptw, cov_struct=ind).fit()
+    out[&quot;iptw&quot;] = gee_contrasts(r1)
+    out[&quot;doubly_robust&quot;] = gee_contrasts(r2)
+    return out
+
+
+def e_value(estimate, ci_limit, sd):
+    def ev(d):
+        rr = math.exp(0.91 * abs(d))
+        return rr + math.sqrt(rr * (rr - 1))
+    return {&quot;point&quot;: ev(estimate / sd), &quot;ci&quot;: ev(ci_limit / sd) if ci_limit &lt; 0 else 1.0}
+
+
+def remission(w):
+    rows = []
+    defs = [(&quot;SHAPS_dich&quot;, lambda x: x &lt;= 2, True), (&quot;HAMD&quot;, lambda x: x &lt;= 7, False), (&quot;HAMA&quot;, lambda x: x &lt;= 7, False)]
+    for var, rule, adjust in defs:
+        for tp in FOLLOWUPS:
+            d = w.dropna(subset=[f&quot;{var}_{tp}&quot;]).copy()
+            d[&quot;rem&quot;] = rule(d[f&quot;{var}_{tp}&quot;]).astype(int)
+            a, b = d[d.group_treat == 1].rem, d[d.group_treat == 0].rem
+            row = {&quot;outcome&quot;: var, &quot;time&quot;: tp, &quot;buspirone&quot;: (int(a.sum()), len(a)), &quot;control&quot;: (int(b.sum()), len(b)),
+                   &quot;p_unadjusted&quot;: stats.fisher_exact([[a.sum(), len(a) - a.sum()], [b.sum(), len(b) - b.sum()]])[1]}
+            if adjust:
+                r = smf.logit(&quot;rem ~ group_treat + SHAPS_0W + C(Center) + FE_0W&quot;, d).fit(disp=False)
+                ci = np.exp(r.conf_int().loc[&quot;group_treat&quot;])
+                row.update({&quot;OR&quot;: math.exp(r.params.group_treat), &quot;ci_low&quot;: ci[0], &quot;ci_high&quot;: ci[1], &quot;p_adjusted&quot;: r.pvalues.group_treat})
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def anxiety_baseline(w):
+    a = (w.loc[w.group_treat == 1, &quot;HAMA_0W&quot;] &gt;= 14)
+    b = (w.loc[w.group_treat == 0, &quot;HAMA_0W&quot;] &gt;= 14)
+    return {&quot;buspirone&quot;: (int(a.sum()), len(a)), &quot;control&quot;: (int(b.sum()), len(b)),
+            &quot;p&quot;: stats.fisher_exact([[a.sum(), len(a) - a.sum()], [b.sum(), len(b) - b.sum()]])[1]}
+
+
+def standardized_differences(w, outcomes):
+    out = {}
+    for o in outcomes:
+        r = lmm(w, o)
+        out[o] = {tp: r[tp][&quot;estimate&quot;] / w[f&quot;{o}_{tp}&quot;].std(ddof=1) for tp in FOLLOWUPS}
+    return out
+
+
+def specificity(w, n_boot=2000, seed=20261026):
+    outcomes = [&quot;SHAPS&quot;, &quot;HAMD&quot;, &quot;HAMD_m7&quot;, &quot;HAMD_m7_14&quot;, &quot;BDI&quot;, &quot;BDI_m4&quot;, &quot;BDI_anh&quot;, &quot;HAMA&quot;, &quot;BAI&quot;]
+    models = {o: lmm(w, o) for o in outcomes}
+    sd = {o: {tp: models[o][tp][&quot;estimate&quot;] / w[f&quot;{o}_{tp}&quot;].std(ddof=1) for tp in FOLLOWUPS} for o in outcomes}
+    compare = [&quot;HAMD&quot;, &quot;HAMD_m7&quot;, &quot;HAMD_m7_14&quot;, &quot;BDI&quot;, &quot;BDI_m4&quot;, &quot;HAMA&quot;, &quot;BAI&quot;]
+    groups = {i: g for i, g in w.groupby(&quot;ID&quot;)}
+    t_ids = w.loc[w.group_treat == 1, &quot;ID&quot;].to_numpy()
+    c_ids = w.loc[w.group_treat == 0, &quot;ID&quot;].to_numpy()
+    boot = []
+    for k in range(n_boot):
+        rng = np.random.default_rng(seed + k)
+        pick = np.concatenate([rng.choice(t_ids, len(t_ids)), rng.choice(c_ids, len(c_ids))])
+        bw = pd.concat([groups[i].assign(ID=f&quot;b{j}&quot;) for j, i in enumerate(pick)], ignore_index=True)
+        boot.append(standardized_differences(bw, [&quot;SHAPS&quot;] + compare))
+    rows = []
+    for tp in FOLLOWUPS:
+        s = np.array([b[&quot;SHAPS&quot;][tp] for b in boot])
+        for o in compare:
+            diff = s - np.array([b[o][tp] for b in boot])
+            rows.append({&quot;time&quot;: tp, &quot;comparison&quot;: f&quot;SHAPS vs {o}&quot;, &quot;sd_SHAPS&quot;: sd[&quot;SHAPS&quot;][tp], &quot;sd_other&quot;: sd[o][tp],
+                         &quot;difference&quot;: sd[&quot;SHAPS&quot;][tp] - sd[o][tp], &quot;ci_low&quot;: np.percentile(diff, 2.5),
+                         &quot;ci_high&quot;: np.percentile(diff, 97.5), &quot;p&quot;: 2 * min((diff &gt;= 0).mean(), (diff &lt;= 0).mean())})
+    return models, sd, pd.DataFrame(rows)
+
+
+def cronbach_alpha(x):
+    x = np.asarray(x, float)
+    k = x.shape[1]
+    return k / (k - 1) * (1 - x.var(axis=0, ddof=1).sum() / x.sum(axis=1).var(ddof=1))
+
+
+def reliability(scored):
+    return pd.DataFrame([{&quot;scale&quot;: s, &quot;visit&quot;: v, &quot;alpha&quot;: cronbach_alpha(scored.loc[scored.visit == v, items(s)])}
+                         for s in OUTCOMES for v in VISITS])
+
+
+def tess(tess_data, events):
+    rows = []
+    for tp in FOLLOWUPS:
+        d = tess_data[tess_data.visit == tp]
+        a, b = d[d.group_treat == 1], d[d.group_treat == 0]
+        rows.append({&quot;time&quot;: tp, &quot;measure&quot;: &quot;TESS_total&quot;, &quot;p&quot;: stats.mannwhitneyu(a.TESS_total, b.TESS_total, alternative=&quot;two-sided&quot;).pvalue})
+        for e in events:
+            x1, n1, x0, n0 = int(a[e].sum()), len(a), int(b[e].sum()), len(b)
+            rr = (x1 / n1) / (x0 / n0) if x0 else np.nan
+            se = math.sqrt(1 / x1 - 1 / n1 + 1 / x0 - 1 / n0) if x1 and x0 else np.nan
+            rows.append({&quot;time&quot;: tp, &quot;measure&quot;: e, &quot;buspirone&quot;: (x1, n1), &quot;control&quot;: (x0, n0), &quot;RR&quot;: rr,
+                         &quot;ci_low&quot;: rr * math.exp(-1.96 * se), &quot;ci_high&quot;: rr * math.exp(1.96 * se),
+                         &quot;p&quot;: stats.fisher_exact([[x1, n1 - x1], [x0, n0 - x0]])[1]})
+    return pd.DataFrame(rows)
+
+
+def main():
+    participants = pd.read_csv(&quot;data/participants.csv&quot;)
+    scales = pd.read_csv(&quot;data/scales.csv&quot;)
+    tess_data = pd.read_csv(&quot;data/tess.csv&quot;).merge(participants[[&quot;ID&quot;, &quot;group_treat&quot;]], on=&quot;ID&quot;)
+    scored = score(scales)
+    w = build_wide(participants, scored)
+
+    results = {&quot;table1&quot;: table1(w),
+               &quot;baseline_differences&quot;: pd.DataFrame([baseline_difference(w, o) for o in OUTCOMES]),
+               &quot;anxiety_baseline&quot;: anxiety_baseline(w),
+               &quot;reliability&quot;: reliability(scored)}
+    models, table2 = main_models(w)
+    table2[&quot;cohen_d&quot;] = [cohen_d_change(w, r.outcome, r.estimate, r.time) for r in table2.itertuples()]
+    results.update({&quot;table2&quot;: table2, &quot;interaction_p&quot;: {o: models[o][&quot;interaction_p&quot;] for o in OUTCOMES},
+                    &quot;sensitivity&quot;: sensitivity(w), &quot;missingness&quot;: missingness(w), &quot;tipping_point&quot;: tipping_point(w)})
+    conf = confounding(w)
+    sd6 = w.SHAPS_6M.std(ddof=1)
+    results[&quot;confounding&quot;] = conf
+    results[&quot;e_value&quot;] = e_value(models[&quot;SHAPS&quot;][&quot;6M&quot;][&quot;estimate&quot;], models[&quot;SHAPS&quot;][&quot;6M&quot;][&quot;ci_high&quot;], sd6)
+    results[&quot;remission&quot;] = remission(w)
+    spec_models, spec_sd, spec_boot = specificity(w)
+    results.update({&quot;specificity_models&quot;: spec_models, &quot;standardized_differences&quot;: spec_sd, &quot;specificity_bootstrap&quot;: spec_boot})
+    results[&quot;tess&quot;] = tess(tess_data, [c for c in tess_data.columns if c not in (&quot;ID&quot;, &quot;visit&quot;, &quot;group_treat&quot;, &quot;TESS_total&quot;)])
+    return results
+
+
+if __name__ == &quot;__main__&quot;:
+    out = main()
+    for k, v in out.items():
+        print(k)
+        print(v)
+</code></pre>
+</body>
+</html>
